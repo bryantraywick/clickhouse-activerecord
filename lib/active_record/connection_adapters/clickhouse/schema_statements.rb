@@ -229,11 +229,12 @@ module ActiveRecord
 
         def new_column_from_field(table_name, field, _definitions)
           sql_type = field[1]
+          cast_type = lookup_cast_type(sql_type)
           type_metadata = fetch_type_metadata(sql_type)
           default_value = extract_value_from_default(field[3], field[2])
           default_function = extract_default_function(field[3])
           default_value = lookup_cast_type(sql_type).cast(default_value)
-          Clickhouse::Column.new(field[0], default_value, type_metadata, field[1].include?('Nullable'), default_function, codec: field[5].presence)
+          Clickhouse::Column.new(field[0], cast_type, default_value, type_metadata, field[1].include?('Nullable'), default_function, codec: field[5].presence)
         end
 
         protected
