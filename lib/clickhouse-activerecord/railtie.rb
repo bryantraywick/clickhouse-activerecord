@@ -4,6 +4,10 @@ module ClickhouseActiverecord
   require 'rails'
 
   class Railtie < Rails::Railtie
-    rake_tasks { load 'tasks/clickhouse.rake' }
+    initializer "clickhouse.load" do
+      ActiveSupport.on_load :active_record do
+        ClickhouseActiverecord.load
+      end
+    end
   end
 end

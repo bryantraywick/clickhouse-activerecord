@@ -6,13 +6,15 @@ require 'active_record'
 require 'clickhouse-activerecord'
 require 'active_support/testing/stream'
 
+ClickhouseActiverecord.load
+
 FIXTURES_PATH = File.join(File.dirname(__FILE__), 'fixtures')
-CLUSTER_NAME = 'test'
 
 RSpec.configure do |config|
   # Enable flags like --only-failures and --next-failure
   config.example_status_persistence_file_path = '.rspec_status'
   config.include ActiveSupport::Testing::Stream
+  config.raise_errors_for_deprecations!
 
   # Disable RSpec exposing methods globally on `Module` and `main`
   config.disable_monkey_patching!
@@ -36,10 +38,11 @@ ActiveRecord::Base.configurations = HashWithIndifferentAccess.new(
   default: {
     adapter: 'clickhouse',
     host: 'localhost',
-    port: 8123,
-    database: 'test',
-    username: nil,
-    password: nil
+    port: ENV['CLICKHOUSE_PORT'] || 8123,
+    database: ENV['CLICKHOUSE_DATABASE'] || 'test',
+    username: ENV['CLICKHOUSE_USER'],
+    password: ENV['CLICKHOUSE_PASSWORD'],
+    cluster_name: ENV['CLICKHOUSE_CLUSTER'],
   }
 )
 

@@ -1,3 +1,3 @@
 module ClickhouseActiverecord
-  VERSION = '0.5.7'
+  VERSION = '1.5.1'
 end

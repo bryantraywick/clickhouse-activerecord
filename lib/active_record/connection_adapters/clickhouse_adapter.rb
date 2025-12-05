@@ -1,16 +1,25 @@
 # frozen_string_literal: true
 
-require 'clickhouse-activerecord/arel/visitors/to_sql'
-require 'clickhouse-activerecord/arel/table'
-require 'clickhouse-activerecord/migration'
+require 'arel/visitors/clickhouse'
+require 'arel/nodes/final'
+require 'arel/nodes/grouping_sets'
+require 'arel/nodes/settings'
+require 'arel/nodes/using'
+require 'arel/nodes/limit_by'
 require 'active_record/connection_adapters/clickhouse/oid/array'
 require 'active_record/connection_adapters/clickhouse/oid/date'
 require 'active_record/connection_adapters/clickhouse/oid/date_time'
 require 'active_record/connection_adapters/clickhouse/oid/big_integer'
-require 'active_record/connection_adapters/clickhouse/schema_definitions'
+require 'active_record/connection_adapters/clickhouse/oid/map'
+require 'active_record/connection_adapters/clickhouse/oid/uuid'
+require 'active_record/connection_adapters/clickhouse/column'
+require 'active_record/connection_adapters/clickhouse/quoting'
 require 'active_record/connection_adapters/clickhouse/schema_creation'
 require 'active_record/connection_adapters/clickhouse/schema_statements'
+require 'active_record/connection_adapters/clickhouse/statement'
+require 'active_record/connection_adapters/clickhouse/table_definition'
 require 'net/http'
+require 'openssl'
 
 module ActiveRecord
   class Base
@@ -19,45 +28,12 @@ module ActiveRecord
       def clickhouse_connection(config)
         config = config.symbolize_keys
 
-        if config[:connection]
-          connection = {
-            connection: config[:connection]
-          }
-        else
-          port = config[:port] || 8123
-          connection = {
-            host: config[:host] || 'localhost',
-            port: port,
-            ssl: config[:ssl].present? ? config[:ssl] : port == 443,
-            sslca: config[:sslca],
-            read_timeout: config[:read_timeout],
-            write_timeout: config[:write_timeout],
-          }
-        end
-
-        if config.key?(:database)
-          database = config[:database]
-        else
+        unless config.key?(:database)
           raise ArgumentError, 'No database specified. Missing argument: database.'
         end
 
-        ConnectionAdapters::ClickhouseAdapter.new(logger, connection, { user: config[:username], password: config[:password], database: database }.compact, config)
+        ConnectionAdapters::ClickhouseAdapter.new(config)
       end
-    end
-  end
-
-  class Relation
-
-    # Replace for only ClickhouseAdapter
-    def reverse_order!
-      orders = order_values.uniq
-      orders.reject!(&:blank?)
-      if self.connection.is_a?(ConnectionAdapters::ClickhouseAdapter) && orders.empty? && !primary_key
-        self.order_values = %w(date created_at).select {|c| column_names.include?(c) }.map{|c| arel_attribute(c).desc }
-      else
-        self.order_values = reverse_sql_order(orders)
-      end
-      self
     end
   end
 
@@ -74,7 +50,14 @@ module ActiveRecord
   end
 
   module ModelSchema
-     module ClassMethods
+    module ClassMethods
+      delegate :final, :final!,
+               :group_by_grouping_sets, :group_by_grouping_sets!,
+               :settings, :settings!,
+               :window, :window!,
+               :limit_by, :limit_by!,
+               to: :all
+
       def is_view
         @is_view || false
       end
@@ -83,20 +66,25 @@ module ActiveRecord
         @is_view = value
       end
 
-      def arel_table # :nodoc:
-        @arel_table ||= ClickhouseActiverecord::Arel::Table.new(table_name, type_caster: type_caster)
+      def _delete_record(constraints)
+        raise ActiveRecord::ActiveRecordError.new('Deleting a row is not possible without a primary key') unless self.primary_key
+        super
       end
-
     end
-   end
+  end
 
   module ConnectionAdapters
-    class ClickhouseColumn < Column
 
+    if ActiveRecord::version >= Gem::Version.new('7.2')
+      register "clickhouse", "ActiveRecord::ConnectionAdapters::ClickhouseAdapter", "active_record/connection_adapters/clickhouse_adapter"
     end
 
     class ClickhouseAdapter < AbstractAdapter
+      include Clickhouse::Quoting
+
       ADAPTER_NAME = 'Clickhouse'.freeze
+      DEFAULT_RESPONSE_FORMAT = 'JSONCompactEachRowWithNamesAndTypes'.freeze
+      USER_AGENT = "ClickHouse ActiveRecord #{ClickhouseActiverecord::VERSION}"
       NATIVE_DATABASE_TYPES = {
         string: { name: 'String' },
         integer: { name: 'UInt32' },
@@ -106,7 +94,7 @@ module ActiveRecord
         datetime: { name: 'DateTime' },
         datetime64: { name: 'DateTime64' },
         date: { name: 'Date' },
-        boolean: { name: 'UInt8' },
+        boolean: { name: 'Bool' },
         uuid: { name: 'UUID' },
 
         enum8: { name: 'Enum8' },
@@ -125,41 +113,68 @@ module ActiveRecord
         uint64: { name: 'UInt64' },
         # uint128: { name: 'UInt128' }, not yet implemented in clickhouse
         uint256: { name: 'UInt256' },
+
+        json: { name: 'JSON' },
       }.freeze
 
       include Clickhouse::SchemaStatements
 
       # Initializes and connects a Clickhouse adapter.
-      def initialize(logger, connection_parameters, config, full_config)
-        super(nil, logger)
-        @connection_parameters = connection_parameters
-        @config = config
-        @debug = full_config[:debug] || false
-        @full_config = full_config
+      def initialize(config_or_deprecated_connection, deprecated_logger = nil, deprecated_connection_options = nil, deprecated_config = nil)
+        super
+        if @config[:connection]
+          connection = {
+            connection: @config[:connection]
+          }
+        else
+          port = @config[:port] || 8123
+          connection = {
+            host: @config[:host] || 'localhost',
+            port: port,
+            ssl: @config[:ssl].present? ? @config[:ssl] : port == 443,
+            sslca: @config[:sslca],
+            read_timeout: @config[:read_timeout],
+            write_timeout: @config[:write_timeout],
+            keep_alive_timeout: @config[:keep_alive_timeout]
+          }
+        end
+        @connection_parameters = connection
+
+        @connection_config = { user: @config[:username], password: @config[:password], database: @config[:database] }.compact
+        @debug = @config[:debug] || false
+        @response_format = @config[:format] || DEFAULT_RESPONSE_FORMAT
 
         @prepared_statements = false
-        if ActiveRecord::version == Gem::Version.new('6.0.0')
-          @prepared_statement_status = Concurrent::ThreadLocalVar.new(false)
-        end
 
         connect
       end
 
-      # Support SchemaMigration from v5.2.2 to v6+
-      def schema_migration # :nodoc:
-        ClickhouseActiverecord::SchemaMigration
+      def disconnect!
+        @connection.finish if @connection&.started?
+        super
+      end
+
+      # Return ClickHouse server version
+      def server_version
+        @server_version ||= select_value('SELECT version()')
+      end
+
+      # Savepoints are not supported, noop
+      def create_savepoint(name)
+      end
+
+      def exec_rollback_to_savepoint(name)
+      end
+
+      def release_savepoint(name)
       end
 
       def migrations_paths
-        @full_config[:migrations_paths] || 'db/migrate_clickhouse'
-      end
-
-      def migration_context # :nodoc:
-        ClickhouseActiverecord::MigrationContext.new(migrations_paths, schema_migration)
+        @config[:migrations_paths] || 'db/migrate_clickhouse'
       end
 
       def arel_visitor # :nodoc:
-        ClickhouseActiverecord::Arel::Visitors::ToSql.new(self)
+        Arel::Visitors::Clickhouse.new(self)
       end
 
       def native_database_types #:nodoc:
@@ -170,67 +185,110 @@ module ActiveRecord
         !native_database_types[type].nil?
       end
 
-      def extract_limit(sql_type) # :nodoc:
-        case sql_type
-          when /(Nullable)?\(?String\)?/
-            super('String')
-          when /(Nullable)?\(?U?Int8\)?/
-            1
-          when /(Nullable)?\(?U?Int16\)?/
-            2
-          when /(Nullable)?\(?U?Int32\)?/
-            nil
-          when /(Nullable)?\(?U?Int64\)?/
-            8
-          else
-            super
+      def supports_indexes_in_create?
+        true
+      end
+
+      class << self
+        def extract_limit(sql_type) # :nodoc:
+          case sql_type
+            when /(Nullable)?\(?String\)?/
+              super('String')
+            when /(Nullable)?\(?U?Int8\)?/
+              1
+            when /(Nullable)?\(?U?Int16\)?/
+              2
+            when /(Nullable)?\(?U?Int32\)?/
+              nil
+            when /(Nullable)?\(?U?Int64\)?/
+              8
+            when /(Nullable)?\(?U?Int128\)?/
+              16
+            else
+              super
+          end
+        end
+
+        # `extract_scale` and `extract_precision` are the same as in the Rails abstract base class,
+        # except this permits a space after the comma
+
+        def extract_scale(sql_type)
+          case sql_type
+          when /\((\d+)\)/ then 0
+          when /\((\d+)(,\s?(\d+))\)/ then $3.to_i
+          end
+        end
+
+        def extract_precision(sql_type)
+          $1.to_i if sql_type =~ /\((\d+)(,\s?\d+)?\)/
+        end
+
+        def initialize_type_map(m) # :nodoc:
+          super
+          register_class_with_limit m, %r(String), Type::String
+          register_class_with_limit m, 'Date',  Clickhouse::OID::Date
+          register_class_with_precision m, %r(datetime)i,  Clickhouse::OID::DateTime
+
+          register_class_with_limit m, %r(Int8), Type::Integer
+          register_class_with_limit m, %r(Int16), Type::Integer
+          register_class_with_limit m, %r(Int32), Type::Integer
+          register_class_with_limit m, %r(Int64), Type::Integer
+          register_class_with_limit m, %r(Int128), Type::Integer
+          register_class_with_limit m, %r(Int256), Type::Integer
+
+          register_class_with_limit m, %r(UInt8), Type::UnsignedInteger
+          register_class_with_limit m, %r(UInt16), Type::UnsignedInteger
+          register_class_with_limit m, %r(UInt32), Type::UnsignedInteger
+          register_class_with_limit m, %r(UInt64), Type::UnsignedInteger
+          #register_class_with_limit m, %r(UInt128), Type::UnsignedInteger #not implemnted in clickhouse
+          register_class_with_limit m, %r(UInt256), Type::UnsignedInteger
+
+          m.register_type %r(bool)i, ActiveModel::Type::Boolean.new
+          m.register_type %r{uuid}i, Clickhouse::OID::Uuid.new
+          # register_class_with_limit m, %r(Array), Clickhouse::OID::Array
+          m.register_type(%r(Array)) do |sql_type|
+            Clickhouse::OID::Array.new(sql_type)
+          end
+
+          m.register_type(%r(Map)) do |sql_type|
+            Clickhouse::OID::Map.new(sql_type)
+          end
+
+          m.register_type %r(JSON)i, ActiveRecord::Type::Json.new
         end
       end
 
-      def initialize_type_map(m) # :nodoc:
-        super
-        register_class_with_limit m, %r(String), Type::String
-        register_class_with_limit m, 'Date',  Clickhouse::OID::Date
-        register_class_with_limit m, 'DateTime',  Clickhouse::OID::DateTime
+      # In Rails 7 used constant TYPE_MAP, we need redefine method
+      def type_map
+        @type_map ||= Type::TypeMap.new.tap { |m| ClickhouseAdapter.initialize_type_map(m) }
+      end
 
-        register_class_with_limit m, %r(Int8), Type::Integer
-        register_class_with_limit m, %r(Int16), Type::Integer
-        register_class_with_limit m, %r(Int32), Type::Integer
-        register_class_with_limit m, %r(Int64), Type::Integer
-        register_class_with_limit m, %r(Int128), Type::Integer
-        register_class_with_limit m, %r(Int256), Type::Integer
-
-        register_class_with_limit m, %r(UInt8), Type::UnsignedInteger
-        register_class_with_limit m, %r(UInt16), Type::UnsignedInteger
-        register_class_with_limit m, %r(UInt32), Type::UnsignedInteger
-        register_class_with_limit m, %r(UInt64), Type::UnsignedInteger
-        #register_class_with_limit m, %r(UInt128), Type::UnsignedInteger #not implemnted in clickhouse
-        register_class_with_limit m, %r(UInt256), Type::UnsignedInteger
-        # register_class_with_limit m, %r(Array), Clickhouse::OID::Array
-        m.register_type(%r(Array)) do |sql_type|
-          Clickhouse::OID::Array.new(sql_type)
+      def quote(value)
+        case value
+        when Array
+          '[' + value.map { |v| quote(v) }.join(', ') + ']'
+        when Hash
+          '{' + value.map { |k, v| "#{quote(k)}: #{quote(v)}" }.join(', ') + '}'
+        else
+          super
         end
       end
 
       # Quoting time without microseconds
       def quoted_date(value)
         if value.acts_like?(:time)
-          zone_conversion_method = ActiveRecord::Base.default_timezone == :utc ? :getutc : :getlocal
+          zone_conversion_method = ActiveRecord.default_timezone == :utc ? :getutc : :getlocal
 
           if value.respond_to?(zone_conversion_method)
             value = value.send(zone_conversion_method)
           end
         end
 
-        value.to_s(:db)
+        value.to_fs(:db)
       end
 
       def column_name_for_operation(operation, node) # :nodoc:
-        if ActiveRecord::version >= Gem::Version.new('6')
-          visitor.compile(node)
-        else
-          column_name_from_arel_node(node)
-        end
+        visitor.compile(node)
       end
 
       # Executes insert +sql+ statement in the context of this connection using
@@ -239,10 +297,15 @@ module ActiveRecord
 
       # SCHEMA STATEMENTS ========================================
 
-      def primary_key(table_name) #:nodoc:
+      def primary_keys(table_name)
+        if server_version.to_f >= 23.4
+          structure = do_system_execute("SHOW COLUMNS FROM `#{table_name}`")
+          return structure['data'].select {|m| m[3]&.include?('PRI') }.pluck(0)
+        end
+
         pk = table_structure(table_name).first
-        return 'id' if pk.present? && pk[0] == 'id'
-        false
+        return ['id'] if pk.present? && pk[0] == 'id'
+        []
       end
 
       def create_schema_dumper(options) # :nodoc:
@@ -250,21 +313,20 @@ module ActiveRecord
       end
 
       # @param [String] table
+      # @option [Boolean] single_line
       # @return [String]
-      def show_create_table(table)
-        do_system_execute("SHOW CREATE TABLE `#{table}`")['data'].try(:first).try(:first).gsub(/[\n\s]+/m, ' ')
+      def show_create_table(table, single_line: true)
+        sql = do_system_execute("SHOW CREATE TABLE `#{table}`")['data'].try(:first).try(:first).gsub("#{@config[:database]}.", '')
+        single_line ? sql.squish : sql
       end
 
       # Create a new ClickHouse database.
       def create_database(name)
         sql = apply_cluster "CREATE DATABASE #{quote_table_name(name)}"
-        log_with_debug(sql, adapter_name) do
-          res = @connection.post("/?#{@config.except(:database).to_param}", sql)
-          process_response(res)
-        end
+        do_system_execute sql, adapter_name, except_params: [:database]
       end
 
-      def create_dictionary(dict_name, **options, &block)
+      def create_dictionary(dict_name, request_settings: {}, **options, &block)
         options.merge!(dictionary: true)
         td = create_table_definition(apply_cluster(dict_name), **options)
         yield td if block_given?
@@ -273,16 +335,16 @@ module ActiveRecord
           drop_dictionary(dict_name, options.merge(if_exists: true))
         end
 
-        execute schema_creation.accept td
+        execute(schema_creation.accept(td), settings: request_settings)
 
         if options[:with_table]
           table_name = options.delete(:with_table)
           dictionary_options = "Dictionary(#{dict_name})"
-          create_table(table_name, **options.merge(options: dictionary_options).except(:dictionary), &block)
+          create_table(table_name, request_settings:, **options.merge(options: dictionary_options).except(:dictionary), &block)
         end
       end
 
-      def create_view(table_name, **options)
+      def create_view(table_name, request_settings: {}, **options)
         options.merge!(view: true)
         options = apply_replica(table_name, options)
         td = create_table_definition(apply_cluster(table_name), **options)
@@ -292,19 +354,24 @@ module ActiveRecord
           drop_table(table_name, options.merge(if_exists: true))
         end
 
-        execute schema_creation.accept td
+        execute(schema_creation.accept(td), settings: request_settings)
       end
 
-      def create_table(table_name, **options, &block)
+      def create_table(table_name, request_settings: {}, **options, &block)
         options = apply_replica(table_name, options)
         td = create_table_definition(apply_cluster(table_name), **options)
         block.call td if block_given?
+        # support old migration version: in 5.0 options id: :integer, but 7.1 options empty
+        # todo remove auto add id column in future
+        if (!options.key?(:id) || options[:id].present? && options[:id] != false) && td[:id].blank? && options[:as].blank?
+          td.column(:id, options[:id] || :integer, null: false)
+        end
 
         if options[:force]
           drop_table(table_name, options.merge(if_exists: true))
         end
 
-        execute schema_creation.accept td
+        execute(schema_creation.accept(td), settings: request_settings)
 
         if options[:with_distributed]
           distributed_table_name = options.delete(:with_distributed)
@@ -312,26 +379,40 @@ module ActiveRecord
           raise 'Set a cluster' unless cluster
 
           distributed_options =
-            "Distributed(#{cluster}, #{@config[:database]}, #{table_name}, #{sharding_key})"
+            "Distributed(#{cluster}, #{@connection_config[:database]}, #{table_name}, #{sharding_key})"
           create_table(distributed_table_name, **options.merge(options: distributed_options), &block)
         end
+      end
+
+      def create_function(name, body, **options)
+        fd = "CREATE#{' OR REPLACE' if options[:force]} FUNCTION #{apply_cluster(quote_table_name(name))} AS #{body}"
+        execute(fd)
       end
 
       # Drops a ClickHouse database.
       def drop_database(name) #:nodoc:
         sql = apply_cluster "DROP DATABASE IF EXISTS #{quote_table_name(name)}"
-        log_with_debug(sql, adapter_name) do
-          res = @connection.post("/?#{@config.except(:database).to_param}", sql)
-          process_response(res)
+        do_system_execute sql, adapter_name, except_params: [:database]
+      end
+
+      def drop_functions
+        functions.each do |function|
+          drop_function(function)
         end
       end
 
       def rename_table(table_name, new_name)
-        do_execute apply_cluster "RENAME TABLE #{quote_table_name(table_name)} TO #{quote_table_name(new_name)}"
+        execute apply_cluster "RENAME TABLE #{quote_table_name(table_name)} TO #{quote_table_name(new_name)}"
       end
 
       def drop_table(table_name, options = {}) # :nodoc:
-        do_execute apply_cluster "DROP TABLE#{' IF EXISTS' if options[:if_exists]} #{quote_table_name(table_name)}"
+        query = "DROP TABLE"
+        query = "#{query} IF EXISTS " if options[:if_exists]
+        query = "#{query} #{quote_table_name(table_name)}"
+        query = apply_cluster(query)
+        query = "#{query} SYNC" if options[:sync]
+
+        execute(query)
 
         if options[:with_distributed]
           distributed_table_name = options.delete(:with_distributed)
@@ -340,7 +421,7 @@ module ActiveRecord
       end
 
       def drop_dictionary(dict_name, options = {})
-        do_execute apply_cluster "DROP DICTIONARY#{' IF EXISTS' if options[:if_exists]} #{quote_table_name(dict_name)}"
+        execute("DROP DICTIONARY#{' IF EXISTS' if options[:if_exists]} #{quote_table_name(dict_name)}")
 
         if options[:with_table]
           table_name = options.delete(:with_table)
@@ -348,8 +429,26 @@ module ActiveRecord
         end
       end
 
-      def change_column(table_name, column_name, type, options = {})
-        result = do_execute "ALTER TABLE #{quote_table_name(table_name)} #{change_column_for_alter(table_name, column_name, type, options)}"
+      def drop_function(name, options = {})
+        query = "DROP FUNCTION"
+        query = "#{query} IF EXISTS " if options[:if_exists]
+        query = "#{query} #{quote_table_name(name)}"
+        query = apply_cluster(query)
+        query = "#{query} SYNC" if options[:sync]
+
+        execute(query)
+      end
+
+      def add_column(table_name, column_name, type, **options)
+        with_settings(wait_end_of_query: 1, send_progress_in_http_headers: 1) { super }
+      end
+
+      def remove_column(table_name, column_name, type = nil, **options)
+        with_settings(wait_end_of_query: 1, send_progress_in_http_headers: 1) { super }
+      end
+
+      def change_column(table_name, column_name, type, **options)
+        result = execute("ALTER TABLE #{quote_table_name(table_name)} #{change_column_for_alter(table_name, column_name, type, **options)}", nil, settings: {wait_end_of_query: 1, send_progress_in_http_headers: 1})
         raise "Error parse json response: #{result}" if result.presence && !result.is_a?(Hash)
       end
 
@@ -363,34 +462,93 @@ module ActiveRecord
         change_column table_name, column_name, nil, {default: default}.compact
       end
 
+      # Adds index description to tables metadata
+      # @link https://clickhouse.com/docs/en/sql-reference/statements/alter/skipping-index
+      def add_index(table_name, expression, **options)
+        index = add_index_options(apply_cluster(table_name), expression, **options)
+        execute schema_creation.accept(CreateIndexDefinition.new(index))
+      end
+
+      # Removes index description from tables metadata and deletes index files from disk
+      def remove_index(table_name, name)
+        query = apply_cluster("ALTER TABLE #{quote_table_name(table_name)}")
+        execute "#{query} DROP INDEX #{quote_column_name(name)}"
+      end
+
+      # Rebuilds the secondary index name for the specified partition_name
+      def rebuild_index(table_name, name, if_exists: false, partition: nil)
+        query = [apply_cluster("ALTER TABLE #{quote_table_name(table_name)}")]
+        query << 'MATERIALIZE INDEX'
+        query << 'IF EXISTS' if if_exists
+        query << quote_column_name(name)
+        query << "IN PARTITION #{quote_column_name(partition)}" if partition
+        execute query.join(' ')
+      end
+
+      # Deletes the secondary index files from disk without removing description
+      def clear_index(table_name, name, if_exists: false, partition: nil)
+        query = [apply_cluster("ALTER TABLE #{quote_table_name(table_name)}")]
+        query << 'CLEAR INDEX'
+        query << 'IF EXISTS' if if_exists
+        query << quote_column_name(name)
+        query << "IN PARTITION #{quote_column_name(partition)}" if partition
+        execute query.join(' ')
+      end
+
       def cluster
-        @full_config[:cluster_name]
+        @config[:cluster_name]
       end
 
       def replica
-        @full_config[:replica_name]
+        @config[:replica_name]
+      end
+
+      def database
+        @config[:database]
+      end
+
+      # Returns the shard name from the configuration.
+      # This is used to identify the shard in replication paths when using both sharding and replication.
+      # Required when you have multiple shards with replication to ensure unique paths for each shard's replication metadata.
+      def shard
+        @config[:shard_name]
       end
 
       def use_default_replicated_merge_tree_params?
-        database_engine_atomic? && @full_config[:use_default_replicated_merge_tree_params]
+        database_engine_atomic? && @config[:use_default_replicated_merge_tree_params]
       end
 
       def use_replica?
         (replica || use_default_replicated_merge_tree_params?) && cluster
       end
 
+      # Returns the path for replication metadata.
+      # When sharding is enabled (shard_name is set), the path includes the shard identifier
+      # to ensure unique paths for each shard's replication metadata.
+      # Format with sharding: /clickhouse/tables/{cluster}/{shard}/{database}.{table}
+      # Format without sharding: /clickhouse/tables/{cluster}/{database}.{table}
       def replica_path(table)
-        "/clickhouse/tables/#{cluster}/#{@config[:database]}.#{table}"
+        if shard
+          "/clickhouse/tables/#{cluster}/#{shard}/#{@connection_config[:database]}.#{table}"
+        else
+          "/clickhouse/tables/#{cluster}/#{@connection_config[:database]}.#{table}"
+        end
       end
 
       def database_engine_atomic?
-        current_database_engine = "select engine from system.databases where name = '#{@config[:database]}'"
-        res = ActiveRecord::Base.connection.select_one(current_database_engine)
+        current_database_engine = "select engine from system.databases where name = '#{@connection_config[:database]}'"
+        res = select_one(current_database_engine)
         res['engine'] == 'Atomic' if res
       end
 
       def apply_cluster(sql)
-        cluster ? "#{sql} ON CLUSTER #{cluster}" : sql
+        if cluster
+          normalized_cluster_name = cluster.start_with?('{') ? "'#{cluster}'" : cluster
+
+          "#{sql} ON CLUSTER #{normalized_cluster_name}"
+        else
+          sql
+        end
       end
 
       def supports_insert_on_duplicate_skip?
@@ -412,9 +570,9 @@ module ActiveRecord
         result
       end
 
-      def change_column_for_alter(table_name, column_name, type, options = {})
+      def change_column_for_alter(table_name, column_name, type, **options)
         td = create_table_definition(table_name)
-        cd = td.new_column_definition(column_name, type, options)
+        cd = td.new_column_definition(column_name, type, **options)
         schema_creation.accept(ChangeColumnDefinition.new(cd, column_name))
       end
 
@@ -427,7 +585,14 @@ module ActiveRecord
         @connection.read_timeout = @connection_parameters[:read_timeout] if @connection_parameters[:read_timeout]
         @connection.write_timeout = @connection_parameters[:write_timeout] if @connection_parameters[:write_timeout]
 
+        # Use clickhouse default keep_alive_timeout value of 10, rather than Net::HTTP's default of 2
+        @connection.keep_alive_timeout = @connection_parameters[:keep_alive_timeout] || 10
+
         @connection
+      end
+
+      def reconnect
+        connect
       end
 
       def apply_replica(table, options)

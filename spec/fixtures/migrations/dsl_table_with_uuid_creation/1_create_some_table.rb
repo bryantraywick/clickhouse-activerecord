@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
-class CreateSomeTable < ActiveRecord::Migration[5.0]
+class CreateSomeTable < ActiveRecord::Migration[7.1]
   def up
-    create_table :some do |t|
+    create_table :some, id: false do |t|
       t.uuid :col1, null: false
       t.uuid :col2, null: true
     end

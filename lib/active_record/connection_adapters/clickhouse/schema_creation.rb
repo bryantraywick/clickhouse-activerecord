@@ -1,4 +1,3 @@
-# frozen_string_literal: true
 begin
   require "active_record/connection_adapters/deduplicable"
 rescue LoadError => e
@@ -34,8 +33,22 @@ module ActiveRecord
           if options[:array]
             sql.gsub!(/\s+(.*)/, ' Array(\1)')
           end
+          if options[:map] == :array
+            sql.gsub!(/\s+(.*)/, ' Map(String, Array(\1))')
+          end
+          if options[:map] == true
+            sql.gsub!(/\s+(.*)/, ' Map(String, \1)')
+          end
+          if options[:codec]
+            sql.gsub!(/\s+(.*)/, " \\1 CODEC(#{options[:codec]})")
+          end
           sql.gsub!(/(\sString)\(\d+\)/, '\1')
-          sql << " DEFAULT #{quote_default_expression(options[:default], options[:column])}" if options_include_default?(options)
+
+          if ::ActiveRecord::version > Gem::Version.new('8.0')
+            sql << " DEFAULT #{quote_default_expression_for_column_definition(options[:default], options[:column])}" if options_include_default?(options)
+          else
+            sql << " DEFAULT #{quote_default_expression(options[:default], options[:column])}" if options_include_default?(options)
+          end
           sql
         end
 
@@ -76,7 +89,9 @@ module ActiveRecord
           # If you do not specify a database explicitly, ClickHouse will use the "default" database.
           return unless subquery
 
-          match = subquery.match(/(?<=from)[^.\w]+(?<database>\w+(?=\.))?(?<table_name>[.\w]+)/i)
+          # Match FROM as a keyword (with word boundary), not as part of a column name
+          # \b ensures we only match 'from' as a whole word
+          match = subquery.match(/\bfrom\s+(?<database>\w+(?=\.))?(?<table_name>[.\w]+)/i)
           return unless match
           return if match[:database]
 
@@ -99,14 +114,23 @@ module ActiveRecord
           create_sql = +entity_type(o)
           create_sql << "IF NOT EXISTS " if o.if_not_exists
           create_sql << "#{quote_table_name(o.name)} "
+          add_as_clause!(create_sql, o) if o.as && !o.view
           add_to_clause!(create_sql, o) if o.materialized
 
           statements = o.columns.map { |c| accept c }
           statements << accept(o.primary_keys) if o.primary_keys
+
+          if supports_indexes_in_create?
+            indexes = o.indexes.map do |expression, options|
+              accept(@conn.add_index_options(o.name, expression, **options))
+            end
+            statements.concat(indexes)
+          end
+
           create_sql << "(#{statements.join(', ')})" if statements.present?
           # Attach options for only table or materialized view without TO section
           add_table_options!(create_sql, o) if !o.view || o.view && o.materialized && !o.to
-          add_as_clause!(create_sql, o)
+          add_as_clause!(create_sql, o) if o.as && o.view
           create_sql
         end
 
@@ -126,7 +150,7 @@ module ActiveRecord
 
         def visit_ChangeColumnDefinition(o)
           column = o.column
-          column.sql_type = type_to_sql(column.type, column.options)
+          column.sql_type = type_to_sql(column.type, **column.options)
           options = column_options(column)
 
           quoted_column_name = quote_column_name(o.name)
@@ -140,6 +164,23 @@ module ActiveRecord
           end
 
           change_column_sql
+        end
+
+        def visit_IndexDefinition(o, create = false)
+          sql = create ? ["ALTER TABLE #{quote_table_name(o.table)} ADD"] : []
+          sql << "INDEX"
+          sql << "IF NOT EXISTS" if o.if_not_exists
+          sql << "IF EXISTS" if o.if_exists
+          sql << "#{quote_column_name(o.name)} (#{o.expression}) TYPE #{o.type}"
+          sql << "GRANULARITY #{o.granularity}" if o.granularity
+          sql << "FIRST #{quote_column_name(o.first)}" if o.first
+          sql << "AFTER #{quote_column_name(o.after)}" if o.after
+
+          sql.join(' ')
+        end
+
+        def visit_CreateIndexDefinition(o)
+          visit_IndexDefinition(o.index, true)
         end
 
         def current_database
