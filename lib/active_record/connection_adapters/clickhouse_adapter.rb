@@ -189,11 +189,6 @@ module ActiveRecord
         true
       end
 
-      def disconnect!
-        @connection.finish
-        super
-      end
-
       class << self
         def extract_limit(sql_type) # :nodoc:
           case sql_type
