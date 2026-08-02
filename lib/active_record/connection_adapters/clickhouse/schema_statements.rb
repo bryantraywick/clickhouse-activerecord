@@ -240,7 +240,7 @@ module ActiveRecord
           versions = migration_context.migrations.map(&:version)
 
           unless migrated.include?(version)
-            _exec_insert("INSERT INTO #{sm_table} (version) VALUES (#{quote(version.to_s)})")
+            do_system_execute("INSERT INTO #{sm_table} (version) VALUES (#{quote(version.to_s)})", nil, format: nil)
           end
 
           inserting = (versions - migrated).select { |v| v < version }
